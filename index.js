@@ -18,7 +18,7 @@ const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5-turbo';
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'text-embedding-3-small';
 const HANDOFF_WEBHOOK_URL = process.env.HANDOFF_WEBHOOK_URL || '';
 
