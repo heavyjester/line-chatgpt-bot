@@ -1,15 +1,14 @@
-// index.js — v2 進階版
+// index.js — v2.5 進階版（Offline FAQ 模式）
 // 功能：
-// 1) FAQ / 知識庫 (RAG-lite)：先檢索 FAQ，再交給 OpenAI 生成正式回覆
-// 2) 多輪對話記憶：保留每位使用者最近 5 輪訊息
-// 3) 真人客服轉接：關鍵字偵測（可選 webhook 通知）
-// 4) 日誌紀錄：JSON Lines 存入 /logs/chatlog.json（Railway 容器重啟後會清空，正式上線可改雲端 DB）
-// 5) 安全與錯誤處理：輸入清洗、簽章錯誤/JSON 錯誤攔截
+// 1) FAQ 本地檢索（不連 OpenAI）
+// 2) 多輪對話記憶（最近 5 輪）
+// 3) 真人客服轉接（可選 webhook 通知）
+// 4) 日誌紀錄（/logs/chatlog.json）
+// 5) 錯誤處理：簽章/JSON 錯誤攔截、GET/HEAD 探活
 
 import 'dotenv/config';
 import express from 'express';
 import { Client, middleware, JSONParseError, SignatureValidationFailed } from '@line/bot-sdk';
-import OpenAI from 'openai';
 import fs from 'fs/promises';
 import path from 'path';
 
@@ -18,22 +17,19 @@ const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'text-embedding-3-small';
 const HANDOFF_WEBHOOK_URL = process.env.HANDOFF_WEBHOOK_URL || '';
+const OFFLINE_MODE = process.env.OFFLINE_MODE === '1' || true; // 預設離線模式
 
 // ---- 初始化 ----
 const app = express();
 const client = new Client(config);
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const PORT = process.env.PORT || 3000;
 
-// 使用者上下文記憶（僅存於記憶體，重啟後清空）
+// 使用者上下文記憶（僅存於記憶體）
 const memory = new Map(); // key: userId, value: [{role, content, ts}]
 
-// FAQ 資料與向量快取
+// FAQ 資料（本地）
 let faq = [];
-let faqVectors = []; // 與 faq 對齊的 embedding 向量（Float32Array）
 
 // ---- 工具函式 ----
 const ensureLogsDir = async () => {
@@ -52,45 +48,48 @@ const cleanInput = (text) => (text || '')
   .slice(0, 2000) // 最長限制
   .trim();
 
-const cosineSim = (a, b) => {
-  let dot = 0, na = 0, nb = 0;
-  for (let i = 0; i < a.length; i++) { dot += a[i]*b[i]; na += a[i]*a[i]; nb += b[i]*b[i]; }
-  return dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-9);
+// --- Very light tokenizer (中英混合) ---
+const tokenize = (s) => {
+  const t = (s || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ');
+  // 針對中英文：把每個中文字也納入 token
+  const zh = [...(s || '').replace(/\s+/g, '')];
+  const en = t.split(/\s+/).filter(Boolean);
+  return Array.from(new Set([...en, ...zh]));
 };
 
-const embed = async (texts) => {
-  const res = await openai.embeddings.create({ model: EMBEDDING_MODEL, input: texts });
-  return res.data.map(d => d.embedding);
+// 簡易相似度（Jaccard + 關鍵詞加權）
+const scoreSimilarity = (q, text) => {
+  const qs = tokenize(q);
+  const ts = tokenize(text);
+  if (qs.length === 0 || ts.length === 0) return 0;
+  const setQ = new Set(qs);
+  const setT = new Set(ts);
+  let inter = 0;
+  for (const w of setQ) if (setT.has(w)) inter++;
+  const jaccard = inter / (setQ.size + setT.size - inter);
+  // 額外關鍵詞加權
+  const bonusWords = ['netwrix','endpoint','protector','dlp','usb','報價','授權','change','tracker','auditor','稽核','合規','macos','windows'];
+  let bonus = 0;
+  for (const bw of bonusWords) if (setQ.has(bw) && setT.has(bw)) bonus += 0.02;
+  return Math.min(1, jaccard + bonus);
 };
 
 const loadFaq = async () => {
   try {
     const raw = await fs.readFile('faq.json', 'utf8');
     faq = JSON.parse(raw); // [{q, a, tags?}]
-    // 建向量（問題+答案一起嵌入，提高可檢索性）
-    const corpus = faq.map(x => `${x.q}\n${x.a}`);
-    faqVectors = (await embed(corpus)).map(v => Float32Array.from(v));
-    console.log(`FAQ loaded: ${faq.length} items with vectors`);
+    console.log(`FAQ loaded (offline): ${faq.length} items`);
   } catch (e) {
     faq = [];
-    faqVectors = [];
     console.warn('No faq.json found or failed to load FAQ (optional):', e.message);
   }
 };
 
-const searchFaq = async (query, topK = 3) => {
+const searchFaqLocal = (query, topK = 3) => {
   if (!faq.length) return [];
-  try {
-    const [qvec] = await embed([query]);
-    const qv = Float32Array.from(qvec);
-    const scored = faqVectors.map((v, i) => ({ i, score: cosineSim(qv, v) }));
-    scored.sort((a, b) => b.score - a.score);
-    const picks = scored.slice(0, topK).filter(s => s.score > 0.2).map(s => ({ ...faq[s.i], score: s.score }));
-    return picks;
-  } catch (e) {
-    console.error('FAQ search error:', e.message);
-    return [];
-  }
+  const scored = faq.map((x, i) => ({ i, score: scoreSimilarity(query, `${x.q}\n${x.a}`) }));
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, topK).filter(s => s.score > 0.08).map(s => ({ ...faq[s.i], score: s.score }));
 };
 
 const pushMemory = (userId, role, content) => {
@@ -147,31 +146,32 @@ async function handleEvent(event) {
       return;
     }
 
-    // 2) FAQ 檢索（RAG-lite）
-    const faqHits = await searchFaq(userText, 3);
-    const faqContext = faqHits.length
-      ? faqHits.map((x, idx) => `【FAQ#${idx + 1}（相似度 ${x.score.toFixed(2)}）】\nQ: ${x.q}\nA: ${x.a}`).join('\n\n')
-      : '';
+    // 2) FAQ 檢索（Offline）
+    const faqHits = searchFaqLocal(userText, 3);
 
-    // 3) 多輪對話 + FAQ context → OpenAI
-    const contextMsgs = [
-      { role: 'system', content: '你是專業且友善的資安客服助理，回答要精準、條列化、可操作，必要時給下一步指引。' }
-    ];
-    const history = getRecentMessages(userId, 5);
-    contextMsgs.push(...history);
-    if (faqContext) {
-      contextMsgs.push({ role: 'system', content: `以下為公司 FAQ 參考內容，優先使用其中事實：\n\n${faqContext}` });
+    let answer = '';
+    if (faqHits.length > 0) {
+      // 取第一筆為主、附上延伸閱讀
+      const top = faqHits[0];
+      const extras = faqHits.slice(1).map((x, i) => `\n\n（延伸 #${i+2}）Q: ${x.q}\nA: ${x.a}`).join('');
+      answer = `【參考回答】\n${top.a}${extras}`.slice(0, 4900);
+    } else {
+      // 無命中：提供導引
+      answer = '目前為離線 FAQ 模式，請嘗試關鍵詞：如「授權」「報價」「USB 加密」「Change Tracker」「Auditor 稽核」。';
     }
-    contextMsgs.push({ role: 'user', content: userText });
-
-    const completion = await openai.chat.completions.create({ model: OPENAI_MODEL, messages: contextMsgs });
-    const answer = (completion.choices?.[0]?.message?.content || '抱歉，我現在沒有足夠資訊回答。').slice(0, 4900);
 
     await client.replyMessage(event.replyToken, { type: 'text', text: answer });
 
     // 記憶與日誌
     pushMemory(userId, 'assistant', answer);
-    await appendLog({ t: Date.now(), type: 'out', userId, route: faqHits.length ? 'faq+ai' : 'ai', text: answer, hits: faqHits.map(h => ({ q: h.q, score: h.score })) });
+    await appendLog({
+      t: Date.now(),
+      type: 'out',
+      userId,
+      route: faqHits.length ? 'faq-offline' : 'nohit',
+      text: answer,
+      hits: faqHits.map(h => ({ q: h.q, score: Number(h.score.toFixed(3)) }))
+    });
   } catch (err) {
     console.error('handleEvent error:', err);
     try {
@@ -197,32 +197,5 @@ app.use((err, _req, res, _next) => {
 // 啟動
 await loadFaq();
 app.listen(PORT, () => {
-  console.log('Server running on port', PORT);
+  console.log('Server running on port', PORT, 'OFFLINE_MODE=', OFFLINE_MODE);
 });
-
-/* -------------------------
-README（部署補充）
-1) 新增檔案 `faq.json`（放在專案根目錄）：
-[
-  { "q": "什麼是產品A授權？", "a": "產品A按年授權，分標準版/企業版…" },
-  { "q": "是否支援 macOS？", "a": "支援 12 以上版本…" },
-  { "q": "報價流程？", "a": "請提供公司名稱、人數、需求模組…我們 1-2 個工作天回覆。" }
-]
-
-2) Railway → Variables：
-- LINE_CHANNEL_ACCESS_TOKEN = <你的值>
-- LINE_CHANNEL_SECRET = <你的值>
-- OPENAI_API_KEY = <你的值>
-- OPENAI_MODEL = gpt-5-turbo（可省略）
-- EMBEDDING_MODEL = text-embedding-3-small（可省略）
-- HANDOFF_WEBHOOK_URL = https://你的內部通知端點（可省略）
-
-3) Commit 後 Redeploy，看到 Logs：`FAQ loaded: n items with vectors` 即完成。
-4) 驗證：
-- GET / → 200 OK
-- GET /webhook → 200 OK
-- POST /webhook（無簽章）→ 401
-- LINE Verify → 200，手機對話可用
-
-注意：/logs/chatlog.json 寫在容器內，Railway 重新部署會清空。正式上線請改用雲端 DB（如 Supabase、Firestore、MongoDB Atlas）。
-------------------------- */
