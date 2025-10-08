@@ -1,0 +1,24 @@
+1) 新增檔案 `faq.json`（放在專案根目錄）：
+[
+  { "q": "什麼是產品A授權？", "a": "產品A按年授權，分標準版/企業版…" },
+  { "q": "是否支援 macOS？", "a": "支援 12 以上版本…" },
+  { "q": "報價流程？", "a": "請提供公司名稱、人數、需求模組…我們 1-2 個工作天回覆。" }
+]
+
+2) Railway → Variables：
+- LINE_CHANNEL_ACCESS_TOKEN = <你的值>
+- LINE_CHANNEL_SECRET = <你的值>
+- OPENAI_API_KEY = <你的值>
+- OPENAI_MODEL = gpt-5-turbo（可省略）
+- EMBEDDING_MODEL = text-embedding-3-small（可省略）
+- HANDOFF_WEBHOOK_URL = https://你的內部通知端點（可省略）
+
+3) Commit 後 Redeploy，看到 Logs：`FAQ loaded: n items with vectors` 即完成。
+4) 驗證：
+- GET / → 200 OK
+- GET /webhook → 200 OK
+- POST /webhook（無簽章）→ 401
+- LINE Verify → 200，手機對話可用
+
+注意：/logs/chatlog.json 寫在容器內，Railway 重新部署會清空。正式上線請改用雲端 DB（如 Supabase、Firestore、MongoDB Atlas）。
+------------------------- */
